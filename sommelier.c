@@ -2324,6 +2324,8 @@ static void xwl_output_mode(void *data, struct wl_output *output,
   host->refresh = refresh;
 }
 
+#define INCH_IN_MM 25.4
+
 static void xwl_output_done(void *data, struct wl_output *output) {
   struct xwl_host_output *host = wl_output_get_user_data(output);
   int scale_factor;
@@ -2345,6 +2347,27 @@ static void xwl_output_done(void *data, struct wl_output *output) {
   } else {
     scale_factor = ceil(host->scale_factor / host->output->xwl->scale);
     scale = (host->output->xwl->scale * scale_factor) / host->scale_factor;
+  }
+
+  // DPI handling
+  if (host->output->xwl->dpi.size) {
+    int dpi = (*width * INCH_IN_MM) / *physical_width;
+    int adjusted_dpi = *((int*)host->output->xwl->dpi.data);
+    double mmpd;
+    int* p;
+
+    fprintf(stderr, "DPI: %s\nAdjusted DPI: %s", dpi, adjusted_dpi);
+
+    wl_array_for_each(p, &host->output->xwl->dpi) {
+      if (*p > dpi)
+        break;
+
+      adjusted_dpi = *p;
+    }
+
+    mmpd = INCH_IN_MM / adjusted_dpi;
+    *physical_width = *width * mmpd + 0.5;
+    *physical_height = *height * mmpd + 0.5;
   }
 
   wl_output_send_geometry(host->resource, host->x, host->y,
