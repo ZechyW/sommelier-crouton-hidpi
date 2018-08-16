@@ -174,11 +174,10 @@ struct xwl_shell {
 };
 
 struct xwl_host_output {
-  struct xwl *xwl;
+  struct xwl_output *output;
   struct wl_resource *resource;
   struct wl_output *proxy;
   struct zaura_output *aura_output;
-  int internal;
   int x;
   int y;
   int physical_width;
@@ -194,9 +193,11 @@ struct xwl_host_output {
   int scale_factor;
   int current_scale;
   int max_scale;
-  int preferred_scale;
-  int device_scale_factor;
-  int expecting_scale;
+  int adjusted_physical_width;
+  int adjusted_physical_height;
+  int adjusted_width;
+  int adjusted_height;
+  int adjusted_scale_factor;
   struct wl_list link;
 };
 
@@ -642,10 +643,10 @@ enum {
 #define MIN_SCALE 0.1
 #define MAX_SCALE 10.0
 
+#define INCH_IN_MM 25.4
+
 #define MIN_DPI 72
 #define MAX_DPI 9600
-
-#define XCURSOR_SIZE_BASE 24
 
 #define MIN_SIZE (INT_MIN / 10)
 #define MAX_SIZE (INT_MAX / 10)
@@ -653,6 +654,8 @@ enum {
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
+
+#define UNUSED(x) ((void)(x))
 
 #ifndef UNIX_PATH_MAX
 #define UNIX_PATH_MAX 108
@@ -1379,6 +1382,7 @@ static void xwl_data_transfer_create(struct wl_event_loop *event_loop,
   flags = fcntl(write_fd, F_GETFL, 0);
   rv = fcntl(write_fd, F_SETFL, flags | O_NONBLOCK);
   assert(!rv);
+  UNUSED(rv);
 
   transfer = malloc(sizeof(*transfer));
   assert(transfer);
@@ -1493,6 +1497,7 @@ static void xwl_host_surface_attach(struct wl_client *client,
 
         rv = ioctl(host->xwl->virtwl_fd, VIRTWL_IOCTL_NEW, &new_alloc);
         assert(rv == 0);
+        UNUSED(rv);
 
         pool = wl_shm_create_pool(host->xwl->shm->internal, new_alloc.fd, size);
         host->current_buffer->internal = wl_shm_pool_create_buffer(
@@ -2332,129 +2337,57 @@ static void xwl_output_mode(void *data, struct wl_output *output,
   host->refresh = refresh;
 }
 
-//static void xwl_output_done(void *data, struct wl_output *output) {
-//  struct xwl_host_output *host = wl_output_get_user_data(output);
-//  int scale_factor;
-//  double scale;
-//
-//  // Early out if current scale is expected but not yet know.
-//  if (!host->current_scale)
-//    return;
-//
-//  // Always use 1 for scale factor and adjust geometry and mode based on max
-//  // scale factor for Xwayland client. Otherwise, pick an optimal scale factor
-//  // and adjust geometry and mode for it.
-//  if (host->output->xwl->xwayland) {
-//    double current_scale = host->current_scale / 1000.0;
-//    int max_scale_factor = host->max_scale / 1000.0;
-//
-//    scale_factor = 1;
-//    scale = (host->output->xwl->scale * current_scale) / max_scale_factor;
-//  } else {
-//    scale_factor = ceil(host->scale_factor / host->output->xwl->scale);
-//    scale = (host->output->xwl->scale * scale_factor) / host->scale_factor;
-//  }
-//
-//  // DPI handling
-//  if (host->output->xwl->dpi.size) {
-//    int dpi = (*width * INCH_IN_MM) / *physical_width;
-//    int adjusted_dpi = *((int*)host->output->xwl->dpi.data);
-//    double mmpd;
-//    int* p;
-//
-//    fprintf(stderr, "DPI: %s\nAdjusted DPI: %s", dpi, adjusted_dpi);
-//
-//    wl_array_for_each(p, &host->output->xwl->dpi) {
-//      if (*p > dpi)
-//        break;
-//
-//      adjusted_dpi = *p;
-//    }
-//
-//    mmpd = INCH_IN_MM / adjusted_dpi;
-//    *physical_width = *width * mmpd + 0.5;
-//    *physical_height = *height * mmpd + 0.5;
-//  }
-//
-//  wl_output_send_geometry(host->resource, host->x, host->y,
-//                          host->physical_width * scale,
-//                          host->physical_height * scale, host->subpixel,
-//                          host->make, host->model, host->transform);
-//  wl_output_send_mode(host->resource, host->flags | WL_OUTPUT_MODE_CURRENT,
-//                      host->width * scale, host->height * scale, host->refresh);
-//  wl_output_send_scale(host->resource, scale_factor);
-//  wl_output_send_done(host->resource);
-//
-//  // Reset current scale.
-//  host->current_scale = 1000;
-//
-//  // Expect current scale if aura output exists.
-//  if (host->aura_output)
-//    host->current_scale = 0;
-//}
-
-// Back-porting from sommelier-output.c
-#define MAX_OUTPUT_SCALE 2
-#define INCH_IN_MM 25.4
-
-double xwl_output_aura_scale_factor_to_double(int scale_factor) {
-  // Aura scale factor is an enum that for all currently know values
-  // is a scale value multipled by 1000. For example, enum value for
-  // 1.25 scale factor is 1250.
-  return scale_factor / 1000.0;
+static void xwl_send_host_output_state(struct xwl_host_output* host) {
+  wl_output_send_geometry(host->resource, host->x, host->y,
+                          host->adjusted_physical_width,
+                          host->adjusted_physical_height, host->subpixel,
+                          host->make, host->model, host->transform);
+  wl_output_send_mode(host->resource, host->flags | WL_OUTPUT_MODE_CURRENT,
+                      host->adjusted_width, host->adjusted_height,
+                      host->refresh);
+  wl_output_send_scale(host->resource, host->adjusted_scale_factor);
+  wl_output_send_done(host->resource);
 }
 
-void xwl_output_get_host_output_state(struct xwl_host_output* host,
-                                     int* scale,
-                                     int* physical_width,
-                                     int* physical_height,
-                                     int* width,
-                                     int* height) {
-  double preferred_scale =
-          xwl_output_aura_scale_factor_to_double(host->preferred_scale);
-  double current_scale =
-          xwl_output_aura_scale_factor_to_double(host->current_scale);
-  double ideal_scale_factor = 1.0;
-  double scale_factor = host->scale_factor;
+static void xwl_output_done(void *data, struct wl_output *output) {
+  struct xwl_host_output *host = wl_output_get_user_data(output);
+  double scale;
 
-  // Use the scale factor we received from aura shell protocol when available.
-  if (host->xwl->aura_shell) {
-    double device_scale_factor =
-            xwl_output_aura_scale_factor_to_double(host->device_scale_factor);
+  // Early out if current scale is expected but not yet know.
+  if (!host->current_scale)
+    return;
 
-    ideal_scale_factor = device_scale_factor * preferred_scale;
-    scale_factor = device_scale_factor * current_scale;
-  }
+  // Always use 1 for scale factor and adjust geometry and mode based on max
+  // scale factor for Xwayland client. Otherwise, pick an optimal scale factor
+  // and adjust geometry and mode for it.
+  if (host->output->xwl->xwayland) {
+    double current_scale = host->current_scale / 1000.0;
+    int max_scale_factor = host->max_scale / 1000.0;
 
-  // Always use scale=1 and adjust geometry and mode based on ideal
-  // scale factor for Xwayland client. For other clients, pick an optimal
-  // scale and adjust geometry and mode based on it.
-  if (host->xwl->xwayland) {
-    if (scale)
-      *scale = 1;
-    *physical_width = host->physical_width * ideal_scale_factor / scale_factor;
-    *physical_height =
-            host->physical_height * ideal_scale_factor / scale_factor;
-    *width = host->width * host->xwl->scale / scale_factor;
-    *height = host->height * host->xwl->scale / scale_factor;
+    host->adjusted_scale_factor = 1;
+    host->adjusted_physical_width = host->physical_width * current_scale;
+    host->adjusted_physical_height = host->physical_height * current_scale;
+    scale = (host->output->xwl->scale * current_scale) / max_scale_factor;
   } else {
-    int s = MIN(ceil(scale_factor / host->xwl->scale), MAX_OUTPUT_SCALE);
+    int scale_factor = ceil(host->scale_factor / host->output->xwl->scale);
 
-    if (scale)
-      *scale = s;
-    *physical_width = host->physical_width;
-    *physical_height = host->physical_height;
-    *width = host->width * host->xwl->scale * s / scale_factor;
-    *height = host->height * host->xwl->scale * s / scale_factor;
+    host->adjusted_scale_factor = scale_factor;
+    host->adjusted_physical_width = host->physical_width;
+    host->adjusted_physical_height = host->physical_height;
+    scale = (host->output->xwl->scale * scale_factor) / host->scale_factor;
   }
 
-  if (host->xwl->dpi.size) {
-    int dpi = (*width * INCH_IN_MM) / *physical_width;
-    int adjusted_dpi = *((int*)host->xwl->dpi.data);
+  host->adjusted_width = host->width * scale;
+  host->adjusted_height = host->height * scale;
+
+  if (host->output->xwl->dpi.size) {
+    int dpi =
+        (host->adjusted_width * INCH_IN_MM) / host->adjusted_physical_width;
+    int adjusted_dpi = *((int*)host->output->xwl->dpi.data);
     double mmpd;
     int* p;
 
-    wl_array_for_each(p, &host->xwl->dpi) {
+    wl_array_for_each(p, &host->output->xwl->dpi) {
       if (*p > dpi)
         break;
 
@@ -2462,68 +2395,16 @@ void xwl_output_get_host_output_state(struct xwl_host_output* host,
     }
 
     mmpd = INCH_IN_MM / adjusted_dpi;
-    *physical_width = *width * mmpd + 0.5;
-    *physical_height = *height * mmpd + 0.5;
-  }
-}
-
-void xwl_output_send_host_output_state(struct xwl_host_output* host) {
-  int scale;
-  int physical_width;
-  int physical_height;
-  int width;
-  int height;
-
-  xwl_output_get_host_output_state(host, &scale, &physical_width,
-                                  &physical_height, &width, &height);
-
-  // Use density of internal display for all Xwayland outputs. X11 clients
-  // typically lack support for dynamically changing density so it's
-  // preferred to always use the density of the internal display.
-  if (host->xwl->xwayland) {
-    struct xwl_host_output* output;
-
-    wl_list_for_each(output, &host->xwl->host_outputs, link) {
-      if (output->internal) {
-        int internal_width;
-        int internal_height;
-
-        xwl_output_get_host_output_state(output, NULL, &physical_width,
-                                        &physical_height, &internal_width,
-                                        &internal_height);
-
-        physical_width = (physical_width * width) / internal_width;
-        physical_height = (physical_height * height) / internal_height;
-        break;
-      }
-    }
+    host->adjusted_physical_width = host->adjusted_width * mmpd + 0.5;
+    host->adjusted_physical_height = host->adjusted_height * mmpd + 0.5;
   }
 
-  // X/Y are best left at origin as managed X windows are kept centered on
-  // the root window. The result is that all outputs are overlapping and
-  // pointer events can always be dispatched to the visible region of the
-  // window.
-  wl_output_send_geometry(host->resource, host->x, host->y, physical_width, physical_height,
-                          host->subpixel, host->make, host->model,
-                          host->transform);
-  wl_output_send_mode(host->resource, host->flags | WL_OUTPUT_MODE_CURRENT,
-                      width, height, host->refresh);
-  if (wl_resource_get_version(host->resource) >= WL_OUTPUT_SCALE_SINCE_VERSION)
-    wl_output_send_scale(host->resource, scale);
-  if (wl_resource_get_version(host->resource) >= WL_OUTPUT_DONE_SINCE_VERSION)
-    wl_output_send_done(host->resource);
-}
+  xwl_send_host_output_state(host);
 
-static void xwl_output_done(void* data, struct wl_output* output) {
-  struct xwl_host_output* host = wl_output_get_user_data(output);
+  // Reset current scale.
+  host->current_scale = 1000;
 
-  // Early out if scale is expected but not yet know.
-  if (!host->current_scale)
-    return;
-
-  xwl_output_send_host_output_state(host);
-
-  // Expect scale if aura output exists.
+  // Expect current scale if aura output exists.
   if (host->aura_output)
     host->current_scale = 0;
 }
@@ -2581,6 +2462,7 @@ static void xwl_destroy_host_output(struct wl_resource *resource) {
     wl_output_destroy(host->proxy);
   }
   wl_resource_set_user_data(resource, NULL);
+  wl_list_remove(&host->link);
   free(host->make);
   free(host->model);
   free(host);
@@ -2594,7 +2476,7 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
 
   host = malloc(sizeof(*host));
   assert(host);
-  host->xwl = xwl;
+  host->output = output;
   host->resource = wl_resource_create(client, &wl_output_interface,
                                       MIN(version, output->version), id);
   wl_resource_set_implementation(host->resource, NULL, host,
@@ -2605,8 +2487,6 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
   wl_output_set_user_data(host->proxy, host);
   wl_output_add_listener(host->proxy, &xwl_output_listener, host);
   host->aura_output = NULL;
-  // We assume that first output is internal by default.
-  host->internal = wl_list_empty(&xwl->host_outputs);
   host->x = 0;
   host->y = 0;
   host->physical_width = 0;
@@ -2622,11 +2502,12 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
   host->scale_factor = 1;
   host->current_scale = 1000;
   host->max_scale = 1000;
-
-  host->preferred_scale = 1000;
-  host->device_scale_factor = 1000;
-  wl_list_insert(xwl->host_outputs.prev, &host->link);
-
+  host->adjusted_physical_width = 0;
+  host->adjusted_physical_height = 0;
+  host->adjusted_width = 1024;
+  host->adjusted_height = 768;
+  host->adjusted_scale_factor = 1;
+  wl_list_insert(&xwl->host_outputs, &host->link);
   if (xwl->aura_shell &&
       (xwl->aura_shell->version >= ZAURA_SHELL_GET_AURA_OUTPUT_SINCE_VERSION)) {
     host->current_scale = 0;
@@ -4016,7 +3897,12 @@ static void xwl_data_offer_receive(struct wl_client *client,
     int rv;
 
     rv = ioctl(host->xwl->virtwl_fd, VIRTWL_IOCTL_NEW, &new_pipe);
-    assert(!rv);
+    if (rv) {
+      fprintf(stderr, "error: failed to create virtwl pipe: %s\n",
+              strerror(errno));
+      close(fd);
+      return;
+    }
 
     xwl_data_transfer_create(wl_display_get_event_loop(host->xwl->host_display),
                              new_pipe.fd, fd);
@@ -5861,6 +5747,7 @@ static void xwl_internal_data_source_send(void *data,
     flags = fcntl(fd, F_GETFL, 0);
     rv = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     assert(!rv);
+    UNUSED(rv);
 
     xwl->selection_data_source_send_fd = fd;
   } else {
@@ -6006,7 +5893,12 @@ static void xwl_send_data(struct xwl *xwl) {
     };
 
     rv = ioctl(xwl->virtwl_fd, VIRTWL_IOCTL_NEW, &new_pipe);
-    assert(!rv);
+    if (rv) {
+      fprintf(stderr, "error: failed to create virtwl pipe: %s\n",
+              strerror(errno));
+      xwl_send_selection_notify(xwl, XCB_ATOM_NONE);
+      return;
+    }
 
     xwl->selection_data_offer_receive_fd = new_pipe.fd;
     wl_data_offer_receive(xwl->selection_data_offer->internal,
@@ -6215,6 +6107,7 @@ static void xwl_connect(struct xwl *xwl) {
   composite_extension =
       xcb_get_extension_data(xwl->connection, &xcb_composite_id);
   assert(composite_extension->present);
+  UNUSED(composite_extension);
 
   redirect_subwindows_cookie = xcb_composite_redirect_subwindows_checked(
       xwl->connection, xwl->screen->root, XCB_COMPOSITE_REDIRECT_MANUAL);
@@ -6371,50 +6264,13 @@ static void xwl_sd_notify(const char *state) {
 
   rv = sendmsg(fd, &msghdr, MSG_NOSIGNAL);
   assert(rv != -1);
-}
-
-static void xwl_calculate_scale_for_xwayland(struct xwl* xwl) {
-  struct xwl_host_output* output;
-  double default_scale_factor = 1.0;
-  double scale;
-
-  // Find internal output and determine preferred scale factor.
-  wl_list_for_each(output, &xwl->host_outputs, link) {
-    if (output->internal) {
-      double preferred_scale =
-              xwl_output_aura_scale_factor_to_double(output->preferred_scale);
-
-      if (xwl->aura_shell) {
-        double device_scale_factor =
-                xwl_output_aura_scale_factor_to_double(output->device_scale_factor);
-
-        default_scale_factor = device_scale_factor * preferred_scale;
-      }
-      break;
-    }
-  }
-
-  // We use the default scale factor multipled by desired scale set by the
-  // user. This gives us HiDPI support by default but the user can still
-  // adjust it if higher or lower density is preferred.
-  scale = xwl->desired_scale * default_scale_factor;
-
-  // Round to integer scale if wp_viewporter interface is not present.
-  if (!xwl->viewporter)
-    scale = round(scale);
-
-  // Clamp and set scale.
-  xwl->scale = MIN(MAX_SCALE, MAX(MIN_SCALE, scale));
-
-  // Scale affects output state. Send updated output state to xwayland.
-  wl_list_for_each(output, &xwl->host_outputs, link)
-    xwl_output_send_host_output_state(output);
+  UNUSED(rv);
 }
 
 static int xwl_handle_display_ready_event(int fd, uint32_t mask, void *data) {
   struct xwl *xwl = (struct xwl *)data;
+  struct xwl_host_output* host_output;
   char display_name[9];
-  char xcursor_size_str[8];
   int bytes_read = 0;
   pid_t pid;
 
@@ -6445,15 +6301,11 @@ static int xwl_handle_display_ready_event(int fd, uint32_t mask, void *data) {
   xwl->display_ready_event_source = NULL;
   close(fd);
 
-  // Calculate scale now that the default scale factor is known. This also
-  // happens to workaround an issue in Xwayland where an output update is
-  // needed for DPI to be set correctly.
-  xwl_calculate_scale_for_xwayland(xwl);
+  // We need to update each output after Xwayland has been initialized for
+  // DPI to be set correctly. TODO(reveman): Remove when fixed in Xwayland.
+  wl_list_for_each(host_output, &xwl->host_outputs, link)
+      xwl_send_host_output_state(host_output);
   wl_display_flush_clients(xwl->host_display);
-
-  snprintf(xcursor_size_str, sizeof(xcursor_size_str), "%d",
-           (int)(XCURSOR_SIZE_BASE * xwl->scale + 0.5));
-  setenv("XCURSOR_SIZE", xcursor_size_str, 1);
 
   if (xwl->sd_notify)
     xwl_sd_notify(xwl->sd_notify);
@@ -6629,6 +6481,7 @@ static int xwl_handle_virtwl_ctx_event(int fd, uint32_t mask, void *data) {
 
   bytes = sendmsg(xwl->virtwl_socket_fd, &msg, MSG_NOSIGNAL);
   assert(bytes == ioctl_recv->len);
+  UNUSED(bytes);
 
   while (fd_count--)
     close(ioctl_recv->fds[fd_count]);
@@ -6689,6 +6542,7 @@ static int xwl_handle_virtwl_socket_event(int fd, uint32_t mask, void *data) {
   ioctl_send->len = bytes;
   rv = ioctl(xwl->virtwl_ctx_fd, VIRTWL_IOCTL_SEND, ioctl_send);
   assert(!rv);
+  UNUSED(rv);
 
   while (fd_count--)
     close(ioctl_send->fds[fd_count]);
@@ -6737,29 +6591,30 @@ static int xwl_parse_cmd_prefix(char *str, int argc, char **argv) {
 }
 
 static void xwl_print_usage() {
-  printf("usage: sommelier [options] [program] [args...]\n\n"
-         "options:\n"
-         "  -h, --help\t\t\tPrint this help\n"
-         "  -X\t\t\t\tEnable X11 forwarding\n"
-         "  --master\t\t\tRun as master and spawn child processes\n"
-         "  --socket=SOCKET\t\tName of socket to listen on\n"
-         "  --display=DISPLAY\t\tWayland display to connect to\n"
-         "  --shm-driver=DRIVER\t\tSHM driver to use (noop, dmabuf, virtwl)\n"
-         "  --data-driver=DRIVER\t\tData driver to use (noop, virtwl)\n"
-         "  --scale=SCALE\t\t\tScale factor for contents\n"
-         "  --dpi=[DPI[,DPI...]]\t\tDPI buckets\n"
-         "  --peer-cmd-prefix=PREFIX\tPeer process command line prefix\n"
-         "  --accelerators=ACCELERATORS\tList of keyboard accelerators\n"
-         "  --app-id=ID\t\t\tForced application ID for X11 clients\n"
-         "  --x-display=DISPLAY\t\tX11 display to listen on\n"
-         "  --xwayland-path=PATH\t\tPath to Xwayland executable\n"
-         "  --xwayland-cmd-prefix=PREFIX\tXwayland command line prefix\n"
-         "  --no-exit-with-child\t\tKeep process alive after child exists\n"
-         "  --no-clipboard-manager\tDisable X11 clipboard manager\n"
-         "  --frame-color=COLOR\t\tWindow frame color for X11 clients\n"
-         "  --virtwl-device=DEVICE\tVirtWL device to use\n"
-         "  --drm-device=DEVICE\t\tDRM device to use\n"
-         "  --glamor\t\t\tUse glamor to accelerate X11 clients\n");
+  printf(
+      "usage: sommelier [options] [program] [args...]\n\n"
+      "options:\n"
+      "  -h, --help\t\t\tPrint this help\n"
+      "  -X\t\t\t\tEnable X11 forwarding\n"
+      "  --master\t\t\tRun as master and spawn child processes\n"
+      "  --socket=SOCKET\t\tName of socket to listen on\n"
+      "  --display=DISPLAY\t\tWayland display to connect to\n"
+      "  --shm-driver=DRIVER\t\tSHM driver to use (noop, dmabuf, virtwl)\n"
+      "  --data-driver=DRIVER\t\tData driver to use (noop, virtwl)\n"
+      "  --scale=SCALE\t\t\tScale factor for contents\n"
+      "  --dpi=[DPI[,DPI...]]\t\tDPI buckets\n"
+      "  --peer-cmd-prefix=PREFIX\tPeer process command line prefix\n"
+      "  --accelerators=ACCELERATORS\tList of keyboard accelerators\n"
+      "  --app-id=ID\t\t\tForced application ID for X11 clients\n"
+      "  --x-display=DISPLAY\t\tX11 display to listen on\n"
+      "  --xwayland-path=PATH\t\tPath to Xwayland executable\n"
+      "  --xwayland-cmd-prefix=PREFIX\tXwayland command line prefix\n"
+      "  --no-exit-with-child\t\tKeep process alive after child exists\n"
+      "  --no-clipboard-manager\tDisable X11 clipboard manager\n"
+      "  --frame-color=COLOR\t\tWindow frame color for X11 clients\n"
+      "  --virtwl-device=DEVICE\tVirtWL device to use\n"
+      "  --drm-device=DEVICE\t\tDRM device to use\n"
+      "  --glamor\t\t\tUse glamor to accelerate X11 clients\n");
 }
 
 int main(int argc, char **argv) {
