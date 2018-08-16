@@ -503,6 +503,7 @@ struct xwl {
   struct wl_event_source *display_event_source;
   struct wl_event_source *display_ready_event_source;
   struct wl_event_source *sigchld_event_source;
+  struct wl_array dpi;
   int shm_driver;
   int data_driver;
   int wm_fd;
