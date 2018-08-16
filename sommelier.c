@@ -8,6 +8,7 @@
 #include <gbm.h>
 #include <libgen.h>
 #include <limits.h>
+#include "virtwl.h"
 #include <math.h>
 #include <pixman.h>
 #include <stdio.h>
@@ -36,7 +37,6 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "version.h"
 #include "viewporter-client-protocol.h"
-#include "virtwl.h"
 #include "xdg-shell-unstable-v6-client-protocol.h"
 #include "xdg-shell-unstable-v6-server-protocol.h"
 
@@ -98,6 +98,7 @@ struct xwl_host_surface {
   int32_t contents_scale;
   struct xwl_mmap *contents_shm_mmap;
   int is_cursor;
+  int has_output;
   uint32_t last_event_serial;
   struct xwl_output_buffer *current_buffer;
   struct wl_list released_buffers;
@@ -178,6 +179,7 @@ struct xwl_host_output {
   struct wl_resource *resource;
   struct wl_output *proxy;
   struct zaura_output *aura_output;
+  int internal;
   int x;
   int y;
   int physical_width;
@@ -192,12 +194,10 @@ struct xwl_host_output {
   int refresh;
   int scale_factor;
   int current_scale;
+  int preferred_scale;
+  int device_scale_factor;
   int max_scale;
-  int adjusted_physical_width;
-  int adjusted_physical_height;
-  int adjusted_width;
-  int adjusted_height;
-  int adjusted_scale_factor;
+  int expecting_scale;
   struct wl_list link;
 };
 
@@ -375,6 +375,7 @@ struct xwl_host_gtk_surface {
   struct wl_resource *resource;
   struct zaura_surface *proxy;
   struct wl_list link;
+  struct xwl_aura_shell* aura_shell;
 };
 
 struct xwl_viewporter {
@@ -540,13 +541,12 @@ struct xwl {
   int needs_set_input_focus;
   double desired_scale;
   double scale;
-  const char *app_id;
+  const char* application_id;
   int exit_with_child;
   const char *sd_notify;
   int clipboard_manager;
   uint32_t frame_color;
   int has_frame_color;
-  int show_window_title;
   struct xwl_host_seat *default_seat;
   xcb_window_t selection_window;
   xcb_window_t selection_owner;
@@ -648,6 +648,8 @@ enum {
 #define MIN_DPI 72
 #define MAX_DPI 9600
 
+#define XCURSOR_SIZE_BASE 24
+
 #define MIN_SIZE (INT_MIN / 10)
 #define MAX_SIZE (INT_MAX / 10)
 
@@ -663,6 +665,13 @@ enum {
 
 #define LOCK_SUFFIX ".lock"
 #define LOCK_SUFFIXLEN 5
+
+#define APPLICATION_ID_FORMAT_PREFIX "org.chromium.termina"
+#define XID_APPLICATION_ID_FORMAT APPLICATION_ID_FORMAT_PREFIX ".xid.%d"
+#define WM_CLIENT_LEADER_APPLICATION_ID_FORMAT \
+  APPLICATION_ID_FORMAT_PREFIX ".wmclientleader.%d"
+#define WM_CLASS_APPLICATION_ID_FORMAT \
+  APPLICATION_ID_FORMAT_PREFIX ".wmclass.%s"
 
 #define CONTROL_MASK (1 << 0)
 #define ALT_MASK (1 << 1)
@@ -1070,7 +1079,6 @@ static void xwl_window_update(struct xwl_window *window) {
   struct xwl_host_surface *host_surface;
   struct xwl *xwl = window->xwl;
   struct xwl_window *parent = NULL;
-  const char *app_id = NULL;
 
   if (window->host_surface_id) {
     host_resource = wl_client_get_object(xwl->client, window->host_surface_id);
@@ -1113,8 +1121,6 @@ static void xwl_window_update(struct xwl_window *window) {
   assert(xwl->xdg_shell->internal);
 
   if (window->managed) {
-    app_id = xwl->app_id ? xwl->app_id : window->clazz;
-
     if (window->transient_for != XCB_WINDOW_NONE) {
       struct xwl_window *sibling;
 
@@ -1190,6 +1196,32 @@ static void xwl_window_update(struct xwl_window *window) {
 
     if (xwl->aura_shell->version >= ZAURA_SURFACE_SET_STARTUP_ID_SINCE_VERSION)
       zaura_surface_set_startup_id(window->aura_surface, window->startup_id);
+
+    if (xwl->aura_shell->version >=
+        ZAURA_SURFACE_SET_APPLICATION_ID_SINCE_VERSION) {
+      if (xwl->application_id) {
+        zaura_surface_set_application_id(window->aura_surface,
+                                         xwl->application_id);
+
+      } else {
+        char application_id_str[128];
+
+        if (window->clazz) {
+          snprintf(application_id_str, sizeof(application_id_str),
+                   WM_CLASS_APPLICATION_ID_FORMAT, window->clazz);
+        } else if (window->client_leader != XCB_WINDOW_NONE) {
+          snprintf(application_id_str, sizeof(application_id_str),
+                   WM_CLIENT_LEADER_APPLICATION_ID_FORMAT,
+                   window->client_leader);
+        } else {
+          snprintf(application_id_str, sizeof(application_id_str),
+                   XID_APPLICATION_ID_FORMAT, window->id);
+        }
+
+        zaura_surface_set_application_id(window->aura_surface,
+                                         application_id_str);
+      }
+    }
   }
 
   if (window->managed || !parent) {
@@ -1201,10 +1233,8 @@ static void xwl_window_update(struct xwl_window *window) {
     }
     if (parent)
       zxdg_toplevel_v6_set_parent(window->xdg_toplevel, parent->xdg_toplevel);
-    if (window->name && xwl->show_window_title)
+    if (window->name)
       zxdg_toplevel_v6_set_title(window->xdg_toplevel, window->name);
-    if (app_id)
-      zxdg_toplevel_v6_set_app_id(window->xdg_toplevel, app_id);
   } else if (!window->xdg_popup) {
     struct zxdg_positioner_v6 *positioner;
 
@@ -1802,6 +1832,28 @@ static void xwl_destroy_host_surface(struct wl_resource *resource) {
   free(host);
 }
 
+static void xwl_surface_enter(void* data,
+                              struct wl_surface* surface,
+                              struct wl_output* output) {
+  struct xwl_host_surface* host = wl_surface_get_user_data(surface);
+  struct xwl_host_output* host_output = wl_output_get_user_data(output);
+
+  wl_surface_send_enter(host->resource, host_output->resource);
+  host->has_output = 1;
+}
+
+static void xwl_surface_leave(void* data,
+                              struct wl_surface* surface,
+                              struct wl_output* output) {
+  struct xwl_host_surface* host = wl_surface_get_user_data(surface);
+  struct xwl_host_output* host_output = wl_output_get_user_data(output);
+
+  wl_surface_send_leave(host->resource, host_output->resource);
+}
+
+static const struct wl_surface_listener xwl_surface_listener = {
+    xwl_surface_enter, xwl_surface_leave};
+
 static void xwl_region_destroy(struct wl_client *client,
                                struct wl_resource *resource) {
   wl_resource_destroy(resource);
@@ -1864,6 +1916,7 @@ static void xwl_compositor_create_host_surface(struct wl_client *client,
   host_surface->contents_scale = 1;
   host_surface->contents_shm_mmap = NULL;
   host_surface->is_cursor = 0;
+  host_surface->has_output = 0;
   host_surface->last_event_serial = 0;
   host_surface->current_buffer = NULL;
   wl_list_init(&host_surface->released_buffers);
@@ -1875,6 +1928,8 @@ static void xwl_compositor_create_host_surface(struct wl_client *client,
                                  xwl_destroy_host_surface);
   host_surface->proxy = wl_compositor_create_surface(host->proxy);
   wl_surface_set_user_data(host_surface->proxy, host_surface);
+  wl_surface_add_listener(host_surface->proxy, &xwl_surface_listener,
+                          host_surface);
   host_surface->viewport = NULL;
   if (host_surface->xwl->viewporter) {
     host_surface->viewport = wp_viewporter_get_viewport(
@@ -2337,52 +2392,60 @@ static void xwl_output_mode(void *data, struct wl_output *output,
   host->refresh = refresh;
 }
 
-static void xwl_send_host_output_state(struct xwl_host_output* host) {
-  wl_output_send_geometry(host->resource, host->x, host->y,
-                          host->adjusted_physical_width,
-                          host->adjusted_physical_height, host->subpixel,
-                          host->make, host->model, host->transform);
-  wl_output_send_mode(host->resource, host->flags | WL_OUTPUT_MODE_CURRENT,
-                      host->adjusted_width, host->adjusted_height,
-                      host->refresh);
-  wl_output_send_scale(host->resource, host->adjusted_scale_factor);
-  wl_output_send_done(host->resource);
+static double xwl_aura_scale_factor_to_double(int scale_factor) {
+  // Aura scale factor is an enum that for all currently know values
+  // is a scale value multipled by 1000. For example, enum value for
+  // 1.25 scale factor is 1250.
+  return scale_factor / 1000.0;
 }
 
-static void xwl_output_done(void *data, struct wl_output *output) {
-  struct xwl_host_output *host = wl_output_get_user_data(output);
-  double scale;
+static void xwl_send_host_output_state(struct xwl_host_output* host) {
+  double preferred_scale =
+      xwl_aura_scale_factor_to_double(host->preferred_scale);
+  double current_scale = xwl_aura_scale_factor_to_double(host->current_scale);
+  double ideal_scale_factor;
+  double scale_factor;
+  int scale;
+  int physical_width;
+  int physical_height;
+  int width;
+  int height;
 
-  // Early out if current scale is expected but not yet know.
-  if (!host->current_scale)
-    return;
+  if (host->output->xwl->aura_shell &&
+      host->output->xwl->aura_shell->version >=
+          ZAURA_OUTPUT_DEVICE_SCALE_FACTOR_SINCE_VERSION) {
+    double device_scale_factor =
+        xwl_aura_scale_factor_to_double(host->device_scale_factor);
 
-  // Always use 1 for scale factor and adjust geometry and mode based on max
-  // scale factor for Xwayland client. Otherwise, pick an optimal scale factor
-  // and adjust geometry and mode for it.
-  if (host->output->xwl->xwayland) {
-    double current_scale = host->current_scale / 1000.0;
-    int max_scale_factor = host->max_scale / 1000.0;
-
-    host->adjusted_scale_factor = 1;
-    host->adjusted_physical_width = host->physical_width * current_scale;
-    host->adjusted_physical_height = host->physical_height * current_scale;
-    scale = (host->output->xwl->scale * current_scale) / max_scale_factor;
+    ideal_scale_factor = device_scale_factor / preferred_scale;
+    scale_factor = device_scale_factor / current_scale;
   } else {
-    int scale_factor = ceil(host->scale_factor / host->output->xwl->scale);
+    double max_scale = xwl_aura_scale_factor_to_double(host->max_scale);
 
-    host->adjusted_scale_factor = scale_factor;
-    host->adjusted_physical_width = host->physical_width;
-    host->adjusted_physical_height = host->physical_height;
-    scale = (host->output->xwl->scale * scale_factor) / host->scale_factor;
+    // This assumes that max scale is the native resolution.
+    ideal_scale_factor = max_scale / preferred_scale;
+    scale_factor = ideal_scale_factor / current_scale;
   }
 
-  host->adjusted_width = host->width * scale;
-  host->adjusted_height = host->height * scale;
+  // Always use scale=1 and adjust geometry and mode based on ideal
+  // scale factor for Xwayland client. For other clients, pick an optimal
+  // scale and adjust geometry and mode based on it.
+  if (host->output->xwl->xwayland) {
+    scale = 1;
+    physical_width = host->physical_width * ideal_scale_factor / scale_factor;
+    physical_height = host->physical_height * ideal_scale_factor / scale_factor;
+    width = host->width * host->output->xwl->scale / scale_factor;
+    height = host->height * host->output->xwl->scale / scale_factor;
+  } else {
+    scale = ceil(scale_factor / host->output->xwl->scale);
+    physical_width = host->physical_width;
+    physical_height = host->physical_height;
+    width = host->width * host->output->xwl->scale * scale / scale_factor;
+    height = host->height * host->output->xwl->scale * scale / scale_factor;
+  }
 
   if (host->output->xwl->dpi.size) {
-    int dpi =
-        (host->adjusted_width * INCH_IN_MM) / host->adjusted_physical_width;
+    int dpi = (width * INCH_IN_MM) / physical_width;
     int adjusted_dpi = *((int*)host->output->xwl->dpi.data);
     double mmpd;
     int* p;
@@ -2395,18 +2458,31 @@ static void xwl_output_done(void *data, struct wl_output *output) {
     }
 
     mmpd = INCH_IN_MM / adjusted_dpi;
-    host->adjusted_physical_width = host->adjusted_width * mmpd + 0.5;
-    host->adjusted_physical_height = host->adjusted_height * mmpd + 0.5;
+    physical_width = width * mmpd + 0.5;
+    physical_height = height * mmpd + 0.5;
   }
+
+  wl_output_send_geometry(host->resource, host->x, host->y, physical_width,
+                          physical_height, host->subpixel, host->make,
+                          host->model, host->transform);
+  wl_output_send_mode(host->resource, host->flags | WL_OUTPUT_MODE_CURRENT,
+                      width, height, host->refresh);
+  wl_output_send_scale(host->resource, scale);
+  wl_output_send_done(host->resource);
+}
+
+static void xwl_output_done(void* data, struct wl_output* output) {
+  struct xwl_host_output* host = wl_output_get_user_data(output);
+
+  // Early out if scale is expected but not yet know.
+  if (host->expecting_scale)
+    return;
 
   xwl_send_host_output_state(host);
 
-  // Reset current scale.
-  host->current_scale = 1000;
-
-  // Expect current scale if aura output exists.
+  // Expect scale if aura output exists.
   if (host->aura_output)
-    host->current_scale = 0;
+    host->expecting_scale = 1;
 }
 
 static void xwl_output_scale(void *data, struct wl_output *output,
@@ -2444,12 +2520,33 @@ static void xwl_aura_output_scale(void *data, struct zaura_output *output,
 
   if (flags & ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT)
     host->current_scale = scale;
+  if (flags & ZAURA_OUTPUT_SCALE_PROPERTY_PREFERRED)
+    host->preferred_scale = scale;
 
   host->max_scale = MAX(host->max_scale, scale);
+
+  host->expecting_scale = 0;
+}
+
+static void xwl_aura_output_connection(void* data,
+                                       struct zaura_output* output,
+                                       uint32_t connection) {
+  struct xwl_host_output* host = zaura_output_get_user_data(output);
+
+  host->internal = connection == ZAURA_OUTPUT_CONNECTION_TYPE_INTERNAL;
+}
+
+static void xwl_aura_output_device_scale_factor(void* data,
+                                                struct zaura_output* output,
+                                                uint32_t device_scale_factor) {
+  struct xwl_host_output* host = zaura_output_get_user_data(output);
+
+  host->device_scale_factor = device_scale_factor;
 }
 
 static const struct zaura_output_listener xwl_aura_output_listener = {
-    xwl_aura_output_scale};
+    xwl_aura_output_scale, xwl_aura_output_connection,
+    xwl_aura_output_device_scale_factor};
 
 static void xwl_destroy_host_output(struct wl_resource *resource) {
   struct xwl_host_output *host = wl_resource_get_user_data(resource);
@@ -2487,6 +2584,8 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
   wl_output_set_user_data(host->proxy, host);
   wl_output_add_listener(host->proxy, &xwl_output_listener, host);
   host->aura_output = NULL;
+  // We assume that first output is internal by default.
+  host->internal = wl_list_empty(&xwl->host_outputs);
   host->x = 0;
   host->y = 0;
   host->physical_width = 0;
@@ -2501,21 +2600,21 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
   host->refresh = 60000;
   host->scale_factor = 1;
   host->current_scale = 1000;
+  host->preferred_scale = 1000;
   host->max_scale = 1000;
-  host->adjusted_physical_width = 0;
-  host->adjusted_physical_height = 0;
-  host->adjusted_width = 1024;
-  host->adjusted_height = 768;
-  host->adjusted_scale_factor = 1;
-  wl_list_insert(&xwl->host_outputs, &host->link);
+  host->device_scale_factor = 1000;
+  host->expecting_scale = 0;
+  wl_list_insert(xwl->host_outputs.prev, &host->link);
   if (xwl->aura_shell &&
       (xwl->aura_shell->version >= ZAURA_SHELL_GET_AURA_OUTPUT_SINCE_VERSION)) {
-    host->current_scale = 0;
+    host->expecting_scale = 1;
     host->aura_output =
         zaura_shell_get_aura_output(xwl->aura_shell->internal, host->proxy);
     zaura_output_set_user_data(host->aura_output, host);
     zaura_output_add_listener(host->aura_output, &xwl_aura_output_listener,
                               host);
+    if (xwl->aura_shell->version >= ZAURA_OUTPUT_CONNECTION_SINCE_VERSION)
+      host->internal = 0;
   }
 }
 
@@ -2636,8 +2735,24 @@ static void xwl_host_pointer_set_cursor(struct wl_client *client,
   if (surface_resource) {
     host_surface = wl_resource_get_user_data(surface_resource);
     host_surface->is_cursor = 1;
-    if (host_surface->contents_width && host_surface->contents_height)
+    if (host_surface->contents_width && host_surface->contents_height) {
+      // GTK determines the cursor size/scale based on the output the surface
+      // has entered. If the surface has not entered any output, then have it
+      // enter the internal output. TODO(reveman): Remove this when
+      // surface-output tracking has been implemented in Chrome.
+      if (!host_surface->has_output) {
+        struct xwl_host_output* output;
+
+        wl_list_for_each(output, &host->seat->xwl->host_outputs, link) {
+          if (output->internal) {
+            wl_surface_send_enter(host_surface->resource, output->resource);
+            host_surface->has_output = 1;
+            break;
+          }
+        }
+      }
       wl_surface_commit(host_surface->proxy);
+    }
   }
 
   wl_pointer_set_cursor(host->proxy, serial,
@@ -2867,8 +2982,10 @@ static void xwl_keyboard_enter(void *data, struct wl_keyboard *keyboard,
 static void xwl_keyboard_leave(void *data, struct wl_keyboard *keyboard,
                                uint32_t serial, struct wl_surface *surface) {
   struct xwl_host_keyboard *host = wl_keyboard_get_user_data(keyboard);
+  struct wl_array array;
 
-  xwl_keyboard_set_focus(host, serial, NULL, NULL);
+  wl_array_init(&array);
+  xwl_keyboard_set_focus(host, serial, NULL, &array);
 }
 
 static void xwl_keyboard_key(void *data, struct wl_keyboard *keyboard,
@@ -3110,9 +3227,11 @@ static void xwl_destroy_host_keyboard(struct wl_resource *resource) {
 static void xwl_keyboard_focus_resource_destroyed(struct wl_listener *listener,
                                                   void *data) {
   struct xwl_host_keyboard *host;
+  struct wl_array array;
 
   host = wl_container_of(listener, host, focus_resource_listener);
-  xwl_keyboard_set_focus(host, host->focus_serial, NULL, NULL);
+  wl_array_init(&array);
+  xwl_keyboard_set_focus(host, host->focus_serial, NULL, &array);
 }
 
 static void xwl_host_seat_get_host_keyboard(struct wl_client *client,
@@ -4372,10 +4491,21 @@ static void xwl_bind_host_subcompositor(struct wl_client *client, void *data,
 }
 
 static void xwl_gtk_surface_set_dbus_properties(
-    struct wl_client *client, struct wl_resource *resource,
-    const char *application_id, const char *app_menu_path,
-    const char *menubar_path, const char *window_object_path,
-    const char *application_object_path, const char *unique_bus_name) {}
+    struct wl_client* client,
+    struct wl_resource* resource,
+    const char* application_id,
+    const char* app_menu_path,
+    const char* menubar_path,
+    const char* window_object_path,
+    const char* application_object_path,
+    const char* unique_bus_name) {
+  struct xwl_host_gtk_surface* host = wl_resource_get_user_data(resource);
+
+  if (host->aura_shell->version >=
+      ZAURA_SURFACE_SET_APPLICATION_ID_SINCE_VERSION) {
+    zaura_surface_set_application_id(host->proxy, application_id);
+  }
+}
 
 static void xwl_gtk_surface_set_modal(struct wl_client *client,
                                       struct wl_resource *resource) {}
@@ -4413,6 +4543,7 @@ xwl_gtk_shell_get_gtk_surface(struct wl_client *client,
   assert(host_gtk_surface);
 
   wl_list_insert(&host->surfaces, &host_gtk_surface->link);
+  host_gtk_surface->aura_shell = host->aura_shell;
   host_gtk_surface->resource =
       wl_resource_create(client, &gtk_surface1_interface, 1, id);
   wl_resource_set_implementation(
@@ -5661,7 +5792,7 @@ static void xwl_handle_property_notify(struct xwl *xwl,
       }
     }
 
-    if (!window->xdg_toplevel || !xwl->show_window_title)
+    if (!window->xdg_toplevel)
       return;
 
     if (window->name) {
@@ -6267,10 +6398,55 @@ static void xwl_sd_notify(const char *state) {
   UNUSED(rv);
 }
 
+static void xwl_calculate_scale_for_xwayland(struct xwl* xwl) {
+  struct xwl_host_output* output;
+  double default_scale_factor = 1.0;
+  double scale;
+
+  // Find internal output and determine preferred scale factor.
+  wl_list_for_each(output, &xwl->host_outputs, link) {
+    if (output->internal) {
+      double preferred_scale =
+          xwl_aura_scale_factor_to_double(output->preferred_scale);
+
+      if (xwl->aura_shell &&
+          xwl->aura_shell->version >=
+              ZAURA_OUTPUT_DEVICE_SCALE_FACTOR_SINCE_VERSION) {
+        double device_scale_factor =
+            xwl_aura_scale_factor_to_double(output->device_scale_factor);
+
+        default_scale_factor = device_scale_factor * preferred_scale;
+      } else {
+        double max_scale = xwl_aura_scale_factor_to_double(output->max_scale);
+        // Max scale is expected to be the native resolution and preferred scale
+        // is the default. The difference is the device scale factor.
+        default_scale_factor = max_scale / preferred_scale;
+      }
+      break;
+    }
+  }
+
+  // We use the default scale factor multipled by desired scale set by the
+  // user. This gives us HiDPI support by default but the user can still
+  // adjust it if higher or lower density is preferred.
+  scale = xwl->desired_scale * default_scale_factor;
+
+  // Round to integer scale if wp_viewporter interface is not present.
+  if (!xwl->viewporter)
+    scale = round(scale);
+
+  // Clamp and set scale.
+  xwl->scale = MIN(MAX_SCALE, MAX(MIN_SCALE, scale));
+
+  // Scale affects output state. Send updated output state to xwayland.
+  wl_list_for_each(output, &xwl->host_outputs, link)
+      xwl_send_host_output_state(output);
+}
+
 static int xwl_handle_display_ready_event(int fd, uint32_t mask, void *data) {
   struct xwl *xwl = (struct xwl *)data;
-  struct xwl_host_output* host_output;
   char display_name[9];
+  char xcursor_size_str[8];
   int bytes_read = 0;
   pid_t pid;
 
@@ -6301,11 +6477,15 @@ static int xwl_handle_display_ready_event(int fd, uint32_t mask, void *data) {
   xwl->display_ready_event_source = NULL;
   close(fd);
 
-  // We need to update each output after Xwayland has been initialized for
-  // DPI to be set correctly. TODO(reveman): Remove when fixed in Xwayland.
-  wl_list_for_each(host_output, &xwl->host_outputs, link)
-      xwl_send_host_output_state(host_output);
+  // Calculate scale now that the default scale factor is known. This also
+  // happens to workaround an issue in Xwayland where an output update is
+  // needed for DPI to be set correctly.
+  xwl_calculate_scale_for_xwayland(xwl);
   wl_display_flush_clients(xwl->host_display);
+
+  snprintf(xcursor_size_str, sizeof(xcursor_size_str), "%d",
+           (int)(XCURSOR_SIZE_BASE * xwl->scale + 0.5));
+  setenv("XCURSOR_SIZE", xcursor_size_str, 1);
 
   if (xwl->sd_notify)
     xwl_sd_notify(xwl->sd_notify);
@@ -6605,7 +6785,7 @@ static void xwl_print_usage() {
       "  --dpi=[DPI[,DPI...]]\t\tDPI buckets\n"
       "  --peer-cmd-prefix=PREFIX\tPeer process command line prefix\n"
       "  --accelerators=ACCELERATORS\tList of keyboard accelerators\n"
-      "  --app-id=ID\t\t\tForced application ID for X11 clients\n"
+      "  --application-id=ID\t\tForced application ID for X11 clients\n"
       "  --x-display=DISPLAY\t\tX11 display to listen on\n"
       "  --xwayland-path=PATH\t\tPath to Xwayland executable\n"
       "  --xwayland-cmd-prefix=PREFIX\tXwayland command line prefix\n"
@@ -6661,13 +6841,12 @@ int main(int argc, char **argv) {
       .needs_set_input_focus = 0,
       .desired_scale = 1.0,
       .scale = 1.0,
-      .app_id = NULL,
+      .application_id = NULL,
       .exit_with_child = 1,
       .sd_notify = NULL,
       .clipboard_manager = 0,
       .frame_color = 0,
       .has_frame_color = 0,
-      .show_window_title = 0,
       .default_seat = NULL,
       .selection_window = XCB_WINDOW_NONE,
       .selection_owner = XCB_WINDOW_NONE,
@@ -6709,7 +6888,8 @@ int main(int argc, char **argv) {
                   [ATOM_CLIPBOARD] = {"CLIPBOARD"},
                   [ATOM_CLIPBOARD_MANAGER] = {"CLIPBOARD_MANAGER"},
                   [ATOM_TARGETS] = {"TARGETS"},
-                  [ATOM_TIMESTAMP] = {"TIMESTAMP"}, [ATOM_TEXT] = {"TEXT"},
+                  [ATOM_TIMESTAMP] = {"TIMESTAMP"},
+                  [ATOM_TEXT] = {"TEXT"},
                   [ATOM_INCR] = {"INCR"},
                   [ATOM_WL_SELECTION] = {"_WL_SELECTION"},
           },
@@ -6720,7 +6900,6 @@ int main(int argc, char **argv) {
   const char* dpi = getenv("SOMMELIER_DPI");
   const char *clipboard_manager = getenv("SOMMELIER_CLIPBOARD_MANAGER");
   const char *frame_color = getenv("SOMMELIER_FRAME_COLOR");
-  const char *show_window_title = getenv("SOMMELIER_SHOW_WINDOW_TITLE");
   const char *virtwl_device = getenv("SOMMELIER_VIRTWL_DEVICE");
   const char *drm_device = getenv("SOMMELIER_DRM_DEVICE");
   const char *glamor = getenv("SOMMELIER_GLAMOR");
@@ -6801,10 +6980,10 @@ int main(int argc, char **argv) {
       const char *s = strchr(arg, '=');
       ++s;
       accelerators = s;
-    } else if (strstr(arg, "--app-id") == arg) {
+    } else if (strstr(arg, "--application-id") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
-      xwl.app_id = s;
+      xwl.application_id = s;
     } else if (strstr(arg, "-X") == arg) {
       xwl.xwayland = 1;
     } else if (strstr(arg, "--x-display") == arg) {
@@ -6829,8 +7008,6 @@ int main(int argc, char **argv) {
       const char *s = strchr(arg, '=');
       ++s;
       frame_color = s;
-    } else if (strstr(arg, "--show-window-title") == arg) {
-      show_window_title = "1";
     } else if (strstr(arg, "--virtwl-device") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
@@ -7010,9 +7187,6 @@ int main(int argc, char **argv) {
       xwl.has_frame_color = 1;
     }
   }
-
-  if (show_window_title)
-    xwl.show_window_title = !!strcmp(show_window_title, "0");
 
   // Handle broken pipes without signals that kill the entire process.
   signal(SIGPIPE, SIG_IGN);
