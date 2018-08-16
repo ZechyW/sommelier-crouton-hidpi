@@ -635,6 +635,9 @@ enum {
 #define MIN_SCALE 0.1
 #define MAX_SCALE 10.0
 
+#define MIN_DPI 72
+#define MAX_DPI 9600
+
 #define MIN_SIZE (INT_MIN / 10)
 #define MAX_SIZE (INT_MAX / 10)
 
@@ -6523,6 +6526,7 @@ static void xwl_print_usage() {
          "  --shm-driver=DRIVER\t\tSHM driver to use (noop, dmabuf, virtwl)\n"
          "  --data-driver=DRIVER\t\tData driver to use (noop, virtwl)\n"
          "  --scale=SCALE\t\t\tScale factor for contents\n"
+         "  --dpi=[DPI[,DPI...]]\t\tDPI buckets\n"
          "  --peer-cmd-prefix=PREFIX\tPeer process command line prefix\n"
          "  --accelerators=ACCELERATORS\tList of keyboard accelerators\n"
          "  --app-id=ID\t\t\tForced application ID for X11 clients\n"
@@ -6637,6 +6641,7 @@ int main(int argc, char **argv) {
       .colormaps = {0}};
   const char *display = getenv("SOMMELIER_DISPLAY");
   const char *scale = getenv("SOMMELIER_SCALE");
+  const char* dpi = getenv("SOMMELIER_DPI");
   const char *clipboard_manager = getenv("SOMMELIER_CLIPBOARD_MANAGER");
   const char *frame_color = getenv("SOMMELIER_FRAME_COLOR");
   const char *show_window_title = getenv("SOMMELIER_SHOW_WINDOW_TITLE");
@@ -6712,6 +6717,10 @@ int main(int argc, char **argv) {
       const char *s = strchr(arg, '=');
       ++s;
       scale = s;
+    } else if (strstr(arg, "--dpi") == arg) {
+      const char* s = strchr(arg, '=');
+      ++s;
+      dpi = s;
     } else if (strstr(arg, "--accelerators") == arg) {
       const char *s = strchr(arg, '=');
       ++s;
@@ -7025,6 +7034,25 @@ int main(int argc, char **argv) {
   } else if (xwl.virtwl_fd != -1) {
     xwl.data_driver = DATA_DRIVER_VIRTWL;
   }
+
+  // Use well known values for DPI by default with Xwayland.
+    if (!dpi && xwl.xwayland)
+      dpi = "72,96,160,240,320,480";
+
+    wl_array_init(&xwl.dpi);
+    if (dpi) {
+      char* str = strdup(dpi);
+      char* token = strtok(str, ",");
+      int* p;
+
+      while (token) {
+        p = wl_array_add(&xwl.dpi, sizeof *p);
+        assert(p);
+        *p = MAX(MIN_DPI, MIN(atoi(token), MAX_DPI));
+        token = strtok(NULL, ",");
+      }
+      free(str);
+    }
 
   if (xwl.runprog || xwl.xwayland) {
     // Wayland connection from client.
