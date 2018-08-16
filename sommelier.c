@@ -645,6 +645,8 @@ enum {
 #define MIN_DPI 72
 #define MAX_DPI 9600
 
+#define XCURSOR_SIZE_BASE 24
+
 #define MIN_SIZE (INT_MIN / 10)
 #define MAX_SIZE (INT_MAX / 10)
 
@@ -2479,22 +2481,29 @@ void xwl_output_send_host_output_state(struct xwl_host_output* host) {
   // typically lack support for dynamically changing density so it's
   // preferred to always use the density of the internal display.
   if (host->xwl->xwayland) {
-    int internal_width;
-    int internal_height;
+    struct xwl_host_output* output;
 
-    xwl_output_get_host_output_state(host, NULL, &physical_width,
-                                     &physical_height, &internal_width,
-                                     &internal_height);
+    wl_list_for_each(output, &host->xwl->host_outputs, link) {
+      if (output->internal) {
+        int internal_width;
+        int internal_height;
 
-    physical_width = (physical_width * width) / internal_width;
-    physical_height = (physical_height * height) / internal_height;
+        xwl_output_get_host_output_state(output, NULL, &physical_width,
+                                        &physical_height, &internal_width,
+                                        &internal_height);
+
+        physical_width = (physical_width * width) / internal_width;
+        physical_height = (physical_height * height) / internal_height;
+        break;
+      }
+    }
   }
 
   // X/Y are best left at origin as managed X windows are kept centered on
   // the root window. The result is that all outputs are overlapping and
   // pointer events can always be dispatched to the visible region of the
   // window.
-  wl_output_send_geometry(host->resource, 0, 0, physical_width, physical_height,
+  wl_output_send_geometry(host->resource, host->x, host->y, physical_width, physical_height,
                           host->subpixel, host->make, host->model,
                           host->transform);
   wl_output_send_mode(host->resource, host->flags | WL_OUTPUT_MODE_CURRENT,
@@ -2596,6 +2605,8 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
   wl_output_set_user_data(host->proxy, host);
   wl_output_add_listener(host->proxy, &xwl_output_listener, host);
   host->aura_output = NULL;
+  // We assume that first output is internal by default.
+  host->internal = wl_list_empty(&xwl->host_outputs);
   host->x = 0;
   host->y = 0;
   host->physical_width = 0;
@@ -2614,6 +2625,7 @@ static void xwl_bind_host_output(struct wl_client *client, void *data,
 
   host->preferred_scale = 1000;
   host->device_scale_factor = 1000;
+  wl_list_insert(xwl->host_outputs.prev, &host->link);
 
   if (xwl->aura_shell &&
       (xwl->aura_shell->version >= ZAURA_SHELL_GET_AURA_OUTPUT_SINCE_VERSION)) {
@@ -6361,9 +6373,48 @@ static void xwl_sd_notify(const char *state) {
   assert(rv != -1);
 }
 
+static void xwl_calculate_scale_for_xwayland(struct xwl* xwl) {
+  struct xwl_host_output* output;
+  double default_scale_factor = 1.0;
+  double scale;
+
+  // Find internal output and determine preferred scale factor.
+  wl_list_for_each(output, &xwl->host_outputs, link) {
+    if (output->internal) {
+      double preferred_scale =
+              xwl_output_aura_scale_factor_to_double(output->preferred_scale);
+
+      if (xwl->aura_shell) {
+        double device_scale_factor =
+                xwl_output_aura_scale_factor_to_double(output->device_scale_factor);
+
+        default_scale_factor = device_scale_factor * preferred_scale;
+      }
+      break;
+    }
+  }
+
+  // We use the default scale factor multipled by desired scale set by the
+  // user. This gives us HiDPI support by default but the user can still
+  // adjust it if higher or lower density is preferred.
+  scale = xwl->desired_scale * default_scale_factor;
+
+  // Round to integer scale if wp_viewporter interface is not present.
+  if (!xwl->viewporter)
+    scale = round(scale);
+
+  // Clamp and set scale.
+  xwl->scale = MIN(MAX_SCALE, MAX(MIN_SCALE, scale));
+
+  // Scale affects output state. Send updated output state to xwayland.
+  wl_list_for_each(output, &xwl->host_outputs, link)
+    xwl_output_send_host_output_state(output);
+}
+
 static int xwl_handle_display_ready_event(int fd, uint32_t mask, void *data) {
   struct xwl *xwl = (struct xwl *)data;
   char display_name[9];
+  char xcursor_size_str[8];
   int bytes_read = 0;
   pid_t pid;
 
@@ -6393,6 +6444,16 @@ static int xwl_handle_display_ready_event(int fd, uint32_t mask, void *data) {
   wl_event_source_remove(xwl->display_ready_event_source);
   xwl->display_ready_event_source = NULL;
   close(fd);
+
+  // Calculate scale now that the default scale factor is known. This also
+  // happens to workaround an issue in Xwayland where an output update is
+  // needed for DPI to be set correctly.
+  xwl_calculate_scale_for_xwayland(xwl);
+  wl_display_flush_clients(xwl->host_display);
+
+  snprintf(xcursor_size_str, sizeof(xcursor_size_str), "%d",
+           (int)(XCURSOR_SIZE_BASE * xwl->scale + 0.5));
+  setenv("XCURSOR_SIZE", xcursor_size_str, 1);
 
   if (xwl->sd_notify)
     xwl_sd_notify(xwl->sd_notify);
@@ -7248,6 +7309,7 @@ int main(int argc, char **argv) {
   wl_list_init(&xwl.seats);
   wl_list_init(&xwl.windows);
   wl_list_init(&xwl.unpaired_windows);
+  wl_list_init(&xwl.host_outputs);
 
   // Parse the list of accelerators that should be reserved by the
   // compositor. Format is "|MODIFIERS|KEYSYM", where MODIFIERS is a
